@@ -1,16 +1,14 @@
-
 #include <iostream>
-#include <fstream>
+#include <cstdio>
 #include <cstring>
-#include <string>
-#include <vector>
 #include <algorithm>
 
 using namespace std;
 
 const int BLOCK_SIZE = 4096;
 const char* DB_FILE = "data.db";
-const int CACHE_SIZE = 8192;
+const int CACHE_SIZE = 16384;
+const int M = 50; // Degree of B+ Tree
 
 struct Key {
     char index[65];
@@ -55,8 +53,8 @@ struct Node {
     int count;
     int parent;
     int next;
-    Key keys[50];
-    int children[51];
+    Key keys[M];
+    int children[M + 1];
 
     Node() {
         is_leaf = false;
@@ -75,10 +73,9 @@ struct Metadata {
 
 class BPlusTree {
 private:
-    fstream fs;
+    FILE* fp;
     Metadata meta;
 
-    // Let's use a simpler cache for speed.
     struct SimpleCache {
         int idx;
         Node node;
@@ -94,15 +91,15 @@ private:
         }
         if (simple_cache[h].occupied) {
             if (simple_cache[h].dirty) {
-                fs.seekp(sizeof(Metadata) + (long long)simple_cache[h].idx * BLOCK_SIZE);
-                fs.write(reinterpret_cast<const char*>(&simple_cache[h].node), sizeof(Node));
+                fseek(fp, sizeof(Metadata) + (long long)simple_cache[h].idx * BLOCK_SIZE, SEEK_SET);
+                fwrite(&simple_cache[h].node, sizeof(Node), 1, fp);
             }
         }
         simple_cache[h].idx = idx;
         simple_cache[h].occupied = true;
         simple_cache[h].dirty = false;
-        fs.seekg(sizeof(Metadata) + (long long)idx * BLOCK_SIZE);
-        fs.read(reinterpret_cast<char*>(&simple_cache[h].node), sizeof(Node));
+        fseek(fp, sizeof(Metadata) + (long long)idx * BLOCK_SIZE, SEEK_SET);
+        fread(&simple_cache[h].node, sizeof(Node), 1, fp);
         return &simple_cache[h].node;
     }
 
@@ -117,8 +114,8 @@ private:
         int h = idx % CACHE_SIZE;
         if (simple_cache[h].occupied && simple_cache[h].idx != idx) {
             if (simple_cache[h].dirty) {
-                fs.seekp(sizeof(Metadata) + (long long)simple_cache[h].idx * BLOCK_SIZE);
-                fs.write(reinterpret_cast<const char*>(&simple_cache[h].node), sizeof(Node));
+                fseek(fp, sizeof(Metadata) + (long long)simple_cache[h].idx * BLOCK_SIZE, SEEK_SET);
+                fwrite(&simple_cache[h].node, sizeof(Node), 1, fp);
             }
         }
         simple_cache[h].idx = idx;
@@ -128,13 +125,13 @@ private:
     }
 
     void read_meta() {
-        fs.seekg(0);
-        fs.read(reinterpret_cast<char*>(&meta), sizeof(Metadata));
+        fseek(fp, 0, SEEK_SET);
+        fread(&meta, sizeof(Metadata), 1, fp);
     }
 
     void write_meta() {
-        fs.seekp(0);
-        fs.write(reinterpret_cast<const char*>(&meta), sizeof(Metadata));
+        fseek(fp, 0, SEEK_SET);
+        fwrite(&meta, sizeof(Metadata), 1, fp);
     }
 
     int allocate_node() {
@@ -157,11 +154,9 @@ public:
             simple_cache[i].occupied = false;
             simple_cache[i].dirty = false;
         }
-        fs.open(DB_FILE, ios::in | ios::out | ios::binary);
-        if (!fs) {
-            fs.open(DB_FILE, ios::out | ios::binary);
-            fs.close();
-            fs.open(DB_FILE, ios::in | ios::out | ios::binary);
+        fp = fopen(DB_FILE, "rb+");
+        if (!fp) {
+            fp = fopen(DB_FILE, "wb+");
             meta.root = -1;
             meta.next_block = 0;
             meta.free_list_head = -1;
@@ -172,15 +167,15 @@ public:
     }
 
     ~BPlusTree() {
-        if (fs.is_open()) {
+        if (fp) {
             for (int i = 0; i < CACHE_SIZE; i++) {
                 if (simple_cache[i].occupied && simple_cache[i].dirty) {
-                    fs.seekp(sizeof(Metadata) + (long long)simple_cache[i].idx * BLOCK_SIZE);
-                    fs.write(reinterpret_cast<const char*>(&simple_cache[i].node), sizeof(Node));
+                    fseek(fp, sizeof(Metadata) + (long long)simple_cache[i].idx * BLOCK_SIZE, SEEK_SET);
+                    fwrite(&simple_cache[i].node, sizeof(Node), 1, fp);
                 }
             }
             write_meta();
-            fs.close();
+            fclose(fp);
         }
         delete[] simple_cache;
     }
@@ -215,23 +210,23 @@ public:
         curr->count++;
         mark_dirty(curr_idx);
 
-        if (curr->count == 50) {
+        if (curr->count == M) {
             split_leaf(curr_idx);
         }
     }
 
     void split_leaf(int idx) {
         Node* node_ptr = get_node(idx);
-        Node node = *node_ptr; // Copy to avoid issues when get_node is called again
+        Node node = *node_ptr;
         int new_idx = allocate_node();
         Node new_node;
         new_node.is_leaf = true;
         new_node.parent = node.parent;
-        new_node.count = 25;
-        for (int i = 0; i < 25; i++) {
-            new_node.keys[i] = node.keys[i + 25];
+        new_node.count = M / 2;
+        for (int i = 0; i < M / 2; i++) {
+            new_node.keys[i] = node.keys[i + M / 2];
         }
-        node.count = 25;
+        node.count = M / 2;
         new_node.next = node.next;
         node.next = new_idx;
 
@@ -276,7 +271,7 @@ public:
         get_node(right_idx)->parent = p_idx;
         mark_dirty(right_idx);
 
-        if (p->count == 50) {
+        if (p->count == M) {
             split_internal(p_idx);
         }
     }
@@ -288,14 +283,14 @@ public:
         Node new_node;
         new_node.is_leaf = false;
         new_node.parent = node.parent;
-        new_node.count = 24;
-        Key mid_key = node.keys[25];
-        for (int i = 0; i < 24; i++) {
-            new_node.keys[i] = node.keys[i + 26];
-            new_node.children[i] = node.children[i + 26];
+        new_node.count = M / 2 - 1;
+        Key mid_key = node.keys[M / 2];
+        for (int i = 0; i < M / 2 - 1; i++) {
+            new_node.keys[i] = node.keys[i + M / 2 + 1];
+            new_node.children[i] = node.children[i + M / 2 + 1];
         }
-        new_node.children[24] = node.children[50];
-        node.count = 25;
+        new_node.children[M / 2 - 1] = node.children[M];
+        node.count = M / 2;
 
         write_node_to_cache(idx, node);
         write_node_to_cache(new_idx, new_node);
@@ -310,7 +305,7 @@ public:
 
     void find(const char* index_str) {
         if (meta.root == -1) {
-            cout << "null" << endl;
+            printf("null\n");
             return;
         }
 
@@ -331,23 +326,23 @@ public:
             for (; i < curr->count; i++) {
                 int cmp = strcmp(index_str, curr->keys[i].index);
                 if (cmp == 0) {
-                    if (!first) cout << " ";
-                    cout << curr->keys[i].value;
+                    if (!first) printf(" ");
+                    printf("%d", curr->keys[i].value);
                     found = true;
                     first = false;
                 } else if (cmp < 0) {
                     if (found) {
-                        cout << endl;
+                        printf("\n");
                         return;
                     }
-                    cout << "null" << endl;
+                    printf("null\n");
                     return;
                 }
             }
             curr_idx = curr->next;
         }
-        if (found) cout << endl;
-        else cout << "null" << endl;
+        if (found) printf("\n");
+        else printf("null\n");
     }
 
     void remove(const Key& key) {
@@ -374,30 +369,27 @@ public:
 };
 
 int main() {
-    ios::sync_with_stdio(false);
-    cin.tie(nullptr);
-
     int n;
-    if (!(cin >> n)) return 0;
+    if (scanf("%d", &n) != 1) return 0;
 
     BPlusTree tree;
 
     while (n--) {
-        string cmd;
-        cin >> cmd;
-        if (cmd == "insert") {
+        char cmd[10];
+        scanf("%s", cmd);
+        if (cmd[0] == 'i') { // insert
             char index[66];
             int value;
-            cin >> index >> value;
+            scanf("%s %d", index, &value);
             tree.insert(Key(index, value));
-        } else if (cmd == "delete") {
+        } else if (cmd[0] == 'd') { // delete
             char index[66];
             int value;
-            cin >> index >> value;
+            scanf("%s %d", index, &value);
             tree.remove(Key(index, value));
-        } else if (cmd == "find") {
+        } else if (cmd[0] == 'f') { // find
             char index[66];
-            cin >> index;
+            scanf("%s", index);
             tree.find(index);
         }
     }
