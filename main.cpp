@@ -10,6 +10,7 @@ using namespace std;
 
 const int BLOCK_SIZE = 4096;
 const char* DB_FILE = "data.db";
+const int CACHE_SIZE = 8192;
 
 struct Key {
     char index[65];
@@ -21,10 +22,8 @@ struct Key {
     }
 
     Key(const char* idx, int v) {
-        int len = strlen(idx);
-        if (len > 64) len = 64;
-        memcpy(index, idx, len);
-        index[len] = '\0';
+        memset(index, 0, sizeof(index));
+        strncpy(index, idx, 64);
         value = v;
     }
 
@@ -55,9 +54,9 @@ struct Node {
     bool is_leaf;
     int count;
     int parent;
-    int next; // next leaf or first child
+    int next;
     Key keys[50];
-    int children[51]; // child block indices or values (not used for leaf values here)
+    int children[51];
 
     Node() {
         is_leaf = false;
@@ -79,14 +78,53 @@ private:
     fstream fs;
     Metadata meta;
 
-    void read_node(int idx, Node& node) {
+    // Let's use a simpler cache for speed.
+    struct SimpleCache {
+        int idx;
+        Node node;
+        bool dirty;
+        bool occupied;
+    };
+    SimpleCache* simple_cache;
+
+    Node* get_node(int idx) {
+        int h = idx % CACHE_SIZE;
+        if (simple_cache[h].occupied && simple_cache[h].idx == idx) {
+            return &simple_cache[h].node;
+        }
+        if (simple_cache[h].occupied) {
+            if (simple_cache[h].dirty) {
+                fs.seekp(sizeof(Metadata) + (long long)simple_cache[h].idx * BLOCK_SIZE);
+                fs.write(reinterpret_cast<const char*>(&simple_cache[h].node), sizeof(Node));
+            }
+        }
+        simple_cache[h].idx = idx;
+        simple_cache[h].occupied = true;
+        simple_cache[h].dirty = false;
         fs.seekg(sizeof(Metadata) + (long long)idx * BLOCK_SIZE);
-        fs.read(reinterpret_cast<char*>(&node), sizeof(Node));
+        fs.read(reinterpret_cast<char*>(&simple_cache[h].node), sizeof(Node));
+        return &simple_cache[h].node;
     }
 
-    void write_node(int idx, const Node& node) {
-        fs.seekp(sizeof(Metadata) + (long long)idx * BLOCK_SIZE);
-        fs.write(reinterpret_cast<const char*>(&node), sizeof(Node));
+    void mark_dirty(int idx) {
+        int h = idx % CACHE_SIZE;
+        if (simple_cache[h].occupied && simple_cache[h].idx == idx) {
+            simple_cache[h].dirty = true;
+        }
+    }
+
+    void write_node_to_cache(int idx, const Node& node) {
+        int h = idx % CACHE_SIZE;
+        if (simple_cache[h].occupied && simple_cache[h].idx != idx) {
+            if (simple_cache[h].dirty) {
+                fs.seekp(sizeof(Metadata) + (long long)simple_cache[h].idx * BLOCK_SIZE);
+                fs.write(reinterpret_cast<const char*>(&simple_cache[h].node), sizeof(Node));
+            }
+        }
+        simple_cache[h].idx = idx;
+        simple_cache[h].node = node;
+        simple_cache[h].occupied = true;
+        simple_cache[h].dirty = true;
     }
 
     void read_meta() {
@@ -103,9 +141,8 @@ private:
         int idx;
         if (meta.free_list_head != -1) {
             idx = meta.free_list_head;
-            Node node;
-            read_node(idx, node);
-            meta.free_list_head = node.next;
+            Node* node = get_node(idx);
+            meta.free_list_head = node->next;
         } else {
             idx = meta.next_block++;
         }
@@ -113,17 +150,13 @@ private:
         return idx;
     }
 
-    void free_node(int idx) {
-        Node node;
-        read_node(idx, node);
-        node.next = meta.free_list_head;
-        write_node(idx, node);
-        meta.free_list_head = idx;
-        write_meta();
-    }
-
 public:
     BPlusTree() {
+        simple_cache = new SimpleCache[CACHE_SIZE];
+        for(int i=0; i<CACHE_SIZE; ++i) {
+            simple_cache[i].occupied = false;
+            simple_cache[i].dirty = false;
+        }
         fs.open(DB_FILE, ios::in | ios::out | ios::binary);
         if (!fs) {
             fs.open(DB_FILE, ios::out | ios::binary);
@@ -140,9 +173,16 @@ public:
 
     ~BPlusTree() {
         if (fs.is_open()) {
+            for (int i = 0; i < CACHE_SIZE; i++) {
+                if (simple_cache[i].occupied && simple_cache[i].dirty) {
+                    fs.seekp(sizeof(Metadata) + (long long)simple_cache[i].idx * BLOCK_SIZE);
+                    fs.write(reinterpret_cast<const char*>(&simple_cache[i].node), sizeof(Node));
+                }
+            }
             write_meta();
             fs.close();
         }
+        delete[] simple_cache;
     }
 
     void insert(const Key& key) {
@@ -152,41 +192,37 @@ public:
             root.is_leaf = true;
             root.count = 1;
             root.keys[0] = key;
-            write_node(meta.root, root);
+            write_node_to_cache(meta.root, root);
             return;
         }
 
         int curr_idx = meta.root;
-        Node curr;
         while (true) {
-            read_node(curr_idx, curr);
-            if (curr.is_leaf) break;
-            int i = 0;
-            while (i < curr.count && key >= curr.keys[i]) i++;
-            curr_idx = curr.children[i];
+            Node* curr = get_node(curr_idx);
+            if (curr->is_leaf) break;
+            int i = upper_bound(curr->keys, curr->keys + curr->count, key) - curr->keys;
+            curr_idx = curr->children[i];
         }
 
-        // Check for duplicate
-        for (int i = 0; i < curr.count; i++) {
-            if (curr.keys[i] == key) return;
-        }
+        Node* curr = get_node(curr_idx);
+        int pos = lower_bound(curr->keys, curr->keys + curr->count, key) - curr->keys;
+        if (pos < curr->count && curr->keys[pos] == key) return;
 
-        // Insert into leaf
-        int i = curr.count - 1;
-        while (i >= 0 && curr.keys[i] > key) {
-            curr.keys[i + 1] = curr.keys[i];
-            i--;
+        for (int i = curr->count - 1; i >= pos; i--) {
+            curr->keys[i + 1] = curr->keys[i];
         }
-        curr.keys[i + 1] = key;
-        curr.count++;
-        write_node(curr_idx, curr);
+        curr->keys[pos] = key;
+        curr->count++;
+        mark_dirty(curr_idx);
 
-        if (curr.count == 50) {
-            split_leaf(curr_idx, curr);
+        if (curr->count == 50) {
+            split_leaf(curr_idx);
         }
     }
 
-    void split_leaf(int idx, Node& node) {
+    void split_leaf(int idx) {
+        Node* node_ptr = get_node(idx);
+        Node node = *node_ptr; // Copy to avoid issues when get_node is called again
         int new_idx = allocate_node();
         Node new_node;
         new_node.is_leaf = true;
@@ -199,16 +235,15 @@ public:
         new_node.next = node.next;
         node.next = new_idx;
 
-        write_node(idx, node);
-        write_node(new_idx, new_node);
+        write_node_to_cache(idx, node);
+        write_node_to_cache(new_idx, new_node);
 
         insert_into_parent(idx, new_node.keys[0], new_idx);
     }
 
     void insert_into_parent(int left_idx, const Key& key, int right_idx) {
-        Node left;
-        read_node(left_idx, left);
-        if (left.parent == -1) {
+        int p_idx = get_node(left_idx)->parent;
+        if (p_idx == -1) {
             int new_root_idx = allocate_node();
             Node new_root;
             new_root.is_leaf = false;
@@ -216,45 +251,39 @@ public:
             new_root.keys[0] = key;
             new_root.children[0] = left_idx;
             new_root.children[1] = right_idx;
-            write_node(new_root_idx, new_root);
+            write_node_to_cache(new_root_idx, new_root);
             meta.root = new_root_idx;
             write_meta();
 
-            left.parent = new_root_idx;
-            write_node(left_idx, left);
-            Node right;
-            read_node(right_idx, right);
-            right.parent = new_root_idx;
-            write_node(right_idx, right);
+            get_node(left_idx)->parent = new_root_idx;
+            mark_dirty(left_idx);
+            get_node(right_idx)->parent = new_root_idx;
+            mark_dirty(right_idx);
             return;
         }
 
-        int p_idx = left.parent;
-        Node p;
-        read_node(p_idx, p);
-
-        int i = p.count - 1;
-        while (i >= 0 && p.keys[i] > key) {
-            p.keys[i + 1] = p.keys[i];
-            p.children[i + 2] = p.children[i + 1];
-            i--;
+        Node* p = get_node(p_idx);
+        int pos = lower_bound(p->keys, p->keys + p->count, key) - p->keys;
+        for (int i = p->count - 1; i >= pos; i--) {
+            p->keys[i + 1] = p->keys[i];
+            p->children[i + 2] = p->children[i + 1];
         }
-        p.keys[i + 1] = key;
-        p.children[i + 2] = right_idx;
-        p.count++;
-        write_node(p_idx, p);
+        p->keys[pos] = key;
+        p->children[pos + 1] = right_idx;
+        p->count++;
+        mark_dirty(p_idx);
 
-        Node right;
-        read_node(right_idx, right);
-        right.parent = p_idx;
-        write_node(right_idx, right);
+        get_node(right_idx)->parent = p_idx;
+        mark_dirty(right_idx);
 
-        if (p.count == 50) {
-            split_internal(p_idx, p);
+        if (p->count == 50) {
+            split_internal(p_idx);
         }
     }
 
-    void split_internal(int idx, Node& node) {
+    void split_internal(int idx) {
+        Node* node_ptr = get_node(idx);
+        Node node = *node_ptr;
         int new_idx = allocate_node();
         Node new_node;
         new_node.is_leaf = false;
@@ -268,14 +297,12 @@ public:
         new_node.children[24] = node.children[50];
         node.count = 25;
 
-        write_node(idx, node);
-        write_node(new_idx, new_node);
+        write_node_to_cache(idx, node);
+        write_node_to_cache(new_idx, new_node);
 
         for (int i = 0; i <= new_node.count; i++) {
-            Node child;
-            read_node(new_node.children[i], child);
-            child.parent = new_idx;
-            write_node(new_node.children[i], child);
+            get_node(new_node.children[i])->parent = new_idx;
+            mark_dirty(new_node.children[i]);
         }
 
         insert_into_parent(idx, mid_key, new_idx);
@@ -288,36 +315,24 @@ public:
         }
 
         int curr_idx = meta.root;
-        Node curr;
         while (true) {
-            read_node(curr_idx, curr);
-            if (curr.is_leaf) break;
-            int i = 0;
-            while (i < curr.count && strcmp(index_str, curr.keys[i].index) >= 0) {
-                // If index_str matches curr.keys[i].index, we might need to go left or right.
-                // In B+ Tree, internal keys are separators.
-                // If key < keys[i], go children[i].
-                // If key >= keys[i], go children[i+1].
-                // Wait, if we have multiple entries with same index, they might span multiple leaves.
-                // We want the FIRST entry with index_str.
-                i++;
-            }
-            // Actually, to find the first possible leaf, we should go to children[i] where i is the first index such that index_str <= keys[i].index
-            // Wait, let's re-evaluate.
+            Node* curr = get_node(curr_idx);
+            if (curr->is_leaf) break;
             int j = 0;
-            while (j < curr.count && strcmp(index_str, curr.keys[j].index) > 0) j++;
-            curr_idx = curr.children[j];
+            while (j < curr->count && strcmp(index_str, curr->keys[j].index) > 0) j++;
+            curr_idx = curr->children[j];
         }
 
         bool found = false;
         bool first = true;
         while (curr_idx != -1) {
-            read_node(curr_idx, curr);
-            for (int i = 0; i < curr.count; i++) {
-                int cmp = strcmp(index_str, curr.keys[i].index);
+            Node* curr = get_node(curr_idx);
+            int i = lower_bound(curr->keys, curr->keys + curr->count, Key(index_str, -2147483648)) - curr->keys;
+            for (; i < curr->count; i++) {
+                int cmp = strcmp(index_str, curr->keys[i].index);
                 if (cmp == 0) {
                     if (!first) cout << " ";
-                    cout << curr.keys[i].value;
+                    cout << curr->keys[i].value;
                     found = true;
                     first = false;
                 } else if (cmp < 0) {
@@ -325,12 +340,11 @@ public:
                         cout << endl;
                         return;
                     }
-                    // If we haven't found it yet and we passed it, it's not there.
                     cout << "null" << endl;
                     return;
                 }
             }
-            curr_idx = curr.next;
+            curr_idx = curr->next;
         }
         if (found) cout << endl;
         else cout << "null" << endl;
@@ -340,33 +354,22 @@ public:
         if (meta.root == -1) return;
 
         int curr_idx = meta.root;
-        Node curr;
         while (true) {
-            read_node(curr_idx, curr);
-            if (curr.is_leaf) break;
-            int i = 0;
-            while (i < curr.count && key >= curr.keys[i]) i++;
-            curr_idx = curr.children[i];
+            Node* curr = get_node(curr_idx);
+            if (curr->is_leaf) break;
+            int i = upper_bound(curr->keys, curr->keys + curr->count, key) - curr->keys;
+            curr_idx = curr->children[i];
         }
 
-        int pos = -1;
-        for (int i = 0; i < curr.count; i++) {
-            if (curr.keys[i] == key) {
-                pos = i;
-                break;
-            }
-        }
+        Node* curr = get_node(curr_idx);
+        int pos = lower_bound(curr->keys, curr->keys + curr->count, key) - curr->keys;
+        if (pos == curr->count || !(curr->keys[pos] == key)) return;
 
-        if (pos == -1) return;
-
-        for (int i = pos; i < curr.count - 1; i++) {
-            curr.keys[i] = curr.keys[i + 1];
+        for (int i = pos; i < curr->count - 1; i++) {
+            curr->keys[i] = curr->keys[i + 1];
         }
-        curr.count--;
-        write_node(curr_idx, curr);
-        // For simplicity, we don't merge nodes on deletion in this version.
-        // Given the constraints and typical CP problems, this might be enough.
-        // If not, I'll implement merging.
+        curr->count--;
+        mark_dirty(curr_idx);
     }
 };
 
